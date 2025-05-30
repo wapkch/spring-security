@@ -16,11 +16,19 @@
 
 package org.springframework.security.saml2.provider.service.registration;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.function.Consumer;
 
+import org.opensaml.saml.common.xml.SAMLConstants;
+import org.opensaml.saml.saml2.metadata.EntityDescriptor;
+import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.security.saml2.Saml2Exception;
 import org.springframework.security.saml2.core.Saml2X509Credential;
 
 /**
@@ -272,6 +280,35 @@ public interface AssertingPartyMetadata extends Serializable {
 		 */
 		AssertingPartyMetadata build();
 
+	}
+
+	 static final ResourceLoader resourceLoader = new DefaultResourceLoader();
+
+	 static Collection<Builder<?>> collectionFromMetadataLocation(String location) {
+		try (InputStream source = resourceLoader.getResource(location).getInputStream()) {
+			return collectionFromMetadata(source);
+		}
+		catch (IOException ex) {
+			if (ex.getCause() instanceof Saml2Exception) {
+				throw (Saml2Exception) ex.getCause();
+			}
+			throw new Saml2Exception(ex);
+		}
+	}
+
+	 static Collection<Builder<?>> collectionFromMetadata(InputStream source) {
+		Collection<Builder<?>> builders = new ArrayList<>();
+		for (EntityDescriptor descriptor : OpenSamlMetadataUtils.descriptors(source)) {
+			if (descriptor.getIDPSSODescriptor(SAMLConstants.SAML20P_NS) != null) {
+				OpenSamlAssertingPartyDetails.Builder builder = OpenSamlAssertingPartyDetails
+						.withEntityDescriptor(descriptor);
+				builders.add(builder);
+			}
+		}
+		if (builders.isEmpty()) {
+			throw new Saml2Exception("Metadata response is missing the necessary IDPSSODescriptor element");
+		}
+		return builders;
 	}
 
 }
