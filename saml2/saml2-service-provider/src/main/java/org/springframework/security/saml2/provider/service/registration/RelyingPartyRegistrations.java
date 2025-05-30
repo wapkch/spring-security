@@ -128,6 +128,10 @@ public final class RelyingPartyRegistrations {
 		return collectionFromMetadata(source).iterator().next();
 	}
 
+	public static RelyingPartyRegistration.Builder fromMetadata(AssertingPartyMetadata metadata) {
+		return  RelyingPartyRegistration.withAssertingPartyMetadata(metadata);
+	}
+
 	/**
 	 * Return a {@link Collection} of {@link RelyingPartyRegistration.Builder}s based off
 	 * of the given SAML 2.0 Asserting Party (IDP) metadata location.
