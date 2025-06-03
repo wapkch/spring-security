@@ -16,33 +16,35 @@
 
 package org.springframework.security.saml2.provider.service.registration;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPrivateKey;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.sql.Types;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.function.Function;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.cryptacular.util.KeyPairUtil;
 import org.opensaml.security.x509.X509Support;
-import org.springframework.core.log.LogMessage;
+import org.springframework.core.serializer.DefaultDeserializer;
+import org.springframework.core.serializer.DefaultSerializer;
+import org.springframework.core.serializer.Deserializer;
+import org.springframework.core.serializer.Serializer;
 import org.springframework.jdbc.core.ArgumentPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.jdbc.core.PreparedStatementSetter;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.core.SqlParameterValue;
-import org.springframework.jdbc.support.lob.DefaultLobHandler;
-import org.springframework.jdbc.support.lob.LobHandler;
 import org.springframework.security.saml2.core.Saml2X509Credential;
 import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistration.AssertingPartyDetails;
 import org.springframework.util.Assert;
@@ -52,16 +54,16 @@ import org.springframework.util.StringUtils;
  * A JDBC implementation of AssertingPartyMetadataRepository.
  *
  * @since 7.0
- * @author wangchao
+ * @author Cathy Wang
  */
 public final class JdbcAssertingPartyMetadataRepository {
 
-	private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+	private Function<AssertingPartyMetadata, List<SqlParameterValue>> assertingPartyMetadataParametersMapper = new AssertingPartyMetadataParametersMapper();
+
+	private SetBytes setBytes = PreparedStatement::setBytes;
 
 	// @formatter:off
-	static final String COLUMN_NAMES = "id, "
-			+ "entity_id, "
-			+ "metadata_uri, "
+	static final String COLUMN_NAMES = "entity_id, "
 			+ "singlesignon_url, "
 			+ "singlesignon_binding, "
 			+ "singlesignon_sign_request, "
@@ -80,21 +82,30 @@ public final class JdbcAssertingPartyMetadataRepository {
 	// @formatter:off
 	private static final String LOAD_BY_ID_SQL = "SELECT " + COLUMN_NAMES
 			+ " FROM " + TABLE_NAME
-			+ " WHERE " + PK_FILTER;
-
-	private static final String LOAD_BY_ENTITY_ID_SQL = "SELECT " + COLUMN_NAMES
-			+ " FROM " + TABLE_NAME
 			+ " WHERE " + ENTITY_ID_FILTER;
 
-	private static final String LOAD_ALL_SQL = "SELECT " + COLUMN_NAMES
-			+ " FROM " + TABLE_NAME;
+	private static final String SAVE_SQL = "INSERT INTO " + TABLE_NAME + " ("
+			+ COLUMN_NAMES
+			+ ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+	// @formatter:on
+
+	private static final String DELETE_SQL = "DELETE FROM " + TABLE_NAME + " WHERE " + ENTITY_ID_FILTER;
+
+	// @formatter:off
+	private static final String UPDATE_SQL = "UPDATE " + TABLE_NAME
+			+ " SET singlesignon_url = ?, " +
+			"singlesignon_binding = ?, " +
+			"singlesignon_sign_request = ?, " +
+			"verification_credentials = ?, " +
+			"singlelogout_url = ? ," +
+			"singlelogout_response_url = ?, " +
+			"singlelogout_binding = ?"
+			+ " WHERE " + ENTITY_ID_FILTER;
 	// @formatter:on
 
 	protected final JdbcOperations jdbcOperations;
 
 	protected RowMapper<AssertingPartyMetadata> assertingPartyMetadataRowMapper;
-
-	protected final LobHandler lobHandler;
 
 	/**
 	 * Constructs a {@code JdbcRelyingPartyRegistrationRepository} using the provided
@@ -102,23 +113,9 @@ public final class JdbcAssertingPartyMetadataRepository {
 	 * @param jdbcOperations the JDBC operations
 	 */
 	public JdbcAssertingPartyMetadataRepository(JdbcOperations jdbcOperations) {
-		this(jdbcOperations, new DefaultLobHandler());
-	}
-
-	/**
-	 * Constructs a {@code JdbcRelyingPartyRegistrationRepository} using the provided
-	 * parameters.
-	 * @param jdbcOperations the JDBC operations
-	 * @param lobHandler the handler for large binary fields and large text fields
-	 */
-	public JdbcAssertingPartyMetadataRepository(JdbcOperations jdbcOperations, LobHandler lobHandler) {
 		Assert.notNull(jdbcOperations, "jdbcOperations cannot be null");
-		Assert.notNull(lobHandler, "lobHandler cannot be null");
 		this.jdbcOperations = jdbcOperations;
-		this.lobHandler = lobHandler;
-		AssertingPartyMetadataRowMapper rowMapper = new AssertingPartyMetadataRowMapper();
-		rowMapper.setLobHandler(lobHandler);
-		this.assertingPartyMetadataRowMapper = rowMapper;
+		this.assertingPartyMetadataRowMapper = new AssertingPartyMetadataRowMapper(ResultSet::getBytes);
 	}
 
 	/**
@@ -134,6 +131,36 @@ public final class JdbcAssertingPartyMetadataRepository {
 		this.assertingPartyMetadataRowMapper = assertingPartyMetadataRowMapper;
 	}
 
+	public void save(AssertingPartyMetadata metadata) {
+		Assert.notNull(metadata, "AssertingPartyMetadata cannot be null");
+		int rows = update(metadata);
+		if (rows == 0) {
+			insert(metadata);
+		}
+	}
+
+	private void insert(AssertingPartyMetadata metadata) {
+		List<SqlParameterValue> parameters = this.assertingPartyMetadataParametersMapper.apply(metadata);
+		PreparedStatementSetter pss = new BlobArgumentPreparedStatementSetter(this.setBytes, parameters.toArray());
+		this.jdbcOperations.update(SAVE_SQL, pss);
+	}
+
+	private int update(AssertingPartyMetadata metadata) {
+		List<SqlParameterValue> parameters = this.assertingPartyMetadataParametersMapper.apply(metadata);
+		SqlParameterValue credentialId = parameters.remove(0);
+		parameters.add(credentialId);
+		PreparedStatementSetter pss = new BlobArgumentPreparedStatementSetter(this.setBytes, parameters.toArray());
+		return this.jdbcOperations.update(UPDATE_SQL, pss);
+	}
+
+	public void delete(String entityId) {
+		Assert.notNull(entityId, "entityId cannot be null");
+		SqlParameterValue[] parameters = new SqlParameterValue[] {
+				new SqlParameterValue(Types.VARCHAR, entityId), };
+		PreparedStatementSetter pss = new ArgumentPreparedStatementSetter(parameters);
+		this.jdbcOperations.update(DELETE_SQL, pss);
+	}
+
 	public AssertingPartyMetadata findUniqueByEntityId(String entityId) {
 		Assert.hasText(entityId, "entityId cannot be empty");
 		SqlParameterValue[] parameters = new SqlParameterValue[] {
@@ -144,38 +171,101 @@ public final class JdbcAssertingPartyMetadataRepository {
 		return !result.isEmpty() ? result.get(0) : null;
 	}
 
+	private static class AssertingPartyMetadataParametersMapper
+			implements Function<AssertingPartyMetadata, List<SqlParameterValue>> {
+
+		private final Serializer<Object> serializer = new DefaultSerializer();
+
+		@Override
+		public List<SqlParameterValue> apply(AssertingPartyMetadata record) {
+			List<SqlParameterValue> parameters = new ArrayList<>();
+			parameters.add(new SqlParameterValue(Types.VARCHAR, record.getEntityId()));
+			parameters.add(new SqlParameterValue(Types.VARCHAR, record.getSingleSignOnServiceLocation()));
+			parameters.add(new SqlParameterValue(Types.VARCHAR, record.getSingleSignOnServiceBinding()));
+			parameters.add(new SqlParameterValue(Types.BOOLEAN, record.getWantAuthnRequestsSigned()));
+			try {
+				parameters.add(new SqlParameterValue(Types.BLOB,
+						this.serializer.serializeToByteArray(record.getVerificationX509Credentials())));
+			} catch (IOException e) {
+				throw new RuntimeException(e);
+			}
+			parameters.add(new SqlParameterValue(Types.VARCHAR, record.getSingleLogoutServiceLocation()));
+			parameters.add(new SqlParameterValue(Types.VARCHAR, record.getSingleLogoutServiceResponseLocation()));
+			parameters.add(new SqlParameterValue(Types.VARCHAR, record.getSingleLogoutServiceBinding()));
+			return parameters;
+		}
+
+		private Timestamp fromInstant(Instant instant) {
+			if (instant == null) {
+				return null;
+			}
+			return Timestamp.from(instant);
+		}
+
+	}
+
+	private static final class BlobArgumentPreparedStatementSetter extends ArgumentPreparedStatementSetter {
+
+		private final SetBytes setBytes;
+
+		private BlobArgumentPreparedStatementSetter(SetBytes setBytes, Object[] args) {
+			super(args);
+			this.setBytes = setBytes;
+		}
+
+		@Override
+		protected void doSetValue(PreparedStatement ps, int parameterPosition, Object argValue) throws SQLException {
+			if (argValue instanceof SqlParameterValue paramValue) {
+				if (paramValue.getSqlType() == Types.BLOB) {
+					if (paramValue.getValue() != null) {
+						Assert.isInstanceOf(byte[].class, paramValue.getValue(),
+								"Value of blob parameter must be byte[]");
+					}
+					byte[] valueBytes = (byte[]) paramValue.getValue();
+					this.setBytes.setBytes(ps, parameterPosition, valueBytes);
+					return;
+				}
+			}
+			super.doSetValue(ps, parameterPosition, argValue);
+		}
+
+	}
+
 	/**
 	 * The default {@link RowMapper} that maps the current row in
-	 * {@code java.sql.ResultSet} to {@link RelyingPartyRegistration}.
+	 * {@code java.sql.ResultSet} to {@link AssertingPartyMetadata}.
 	 */
-	public static class AssertingPartyMetadataRowMapper implements RowMapper<AssertingPartyMetadata> {
+	private final static class AssertingPartyMetadataRowMapper implements RowMapper<AssertingPartyMetadata> {
 
 		private final Log logger = LogFactory.getLog(getClass());
 
-		protected LobHandler lobHandler = new DefaultLobHandler();
 
-		public final void setLobHandler(LobHandler lobHandler) {
-			Assert.notNull(lobHandler, "lobHandler cannot be null");
-			this.lobHandler = lobHandler;
+		private Deserializer<Object> deserializer = new DefaultDeserializer();
+
+		private final GetBytes getBytes;
+
+		AssertingPartyMetadataRowMapper(GetBytes getBytes) {
+			this.getBytes = getBytes;
 		}
 
 		@Override
 		public AssertingPartyMetadata mapRow(ResultSet rs, int rowNum) throws SQLException {
-			String registrationId = rs.getString("id");
+//			String registrationId = rs.getString("id");
 			String entityId = rs.getString("entity_id");
-			String metadataUri = rs.getString("metadata_uri");
+			String metadataUri = null;
+//			String metadataUri = rs.getString("metadata_uri");
 			String singleSignOnUrl = rs.getString("singlesignon_url");
 			Saml2MessageBinding singleSignOnBinding = Saml2MessageBinding
 				.from(rs.getString("singlesignon_binding"));
 			boolean singleSignOnSignRequest = rs.getBoolean("singlesignon_sign_request");
-			List<Certificate> verificationCredentials;
+			Collection<Saml2X509Credential> verificationCredentials;
 			try {
-				verificationCredentials = parseCertificate(
-						getLobValue(rs, "verification_credentials"));
+				verificationCredentials = (Collection<Saml2X509Credential>) deserializer.deserializeFromByteArray(
+						this.getBytes.getBytes(rs, "verification_credentials"));
 			}
-			catch (JsonProcessingException ex) {
-				this.logger.error(
-						LogMessage.format("Verification certificate of %s could not be parsed.", registrationId), ex);
+			catch (IOException ex) {
+//				this.logger.debug(
+//						LogMessage.format("Verification certificate of %s could not be parsed.", registrationId), ex);
 				return null;
 			}
 			String singleLogoutUrl = rs.getString("singlelogout_url");
@@ -189,19 +279,7 @@ public final class JdbcAssertingPartyMetadataRepository {
 					: createBuilderUsingMetadata(entityId, metadataUri);
 			builder.entityId(entityId);
 			builder.wantAuthnRequestsSigned(singleSignOnSignRequest);
-
-			List<Saml2X509Credential> saml2X509Credentials = new ArrayList<>();
-			for (Certificate certificate : verificationCredentials) {
-				try {
-					saml2X509Credentials.add(asVerificationCredential(certificate));
-				}
-				catch (Exception ex) {
-					this.logger.error(LogMessage.format("Verification credentials of %s must have a valid certificate.",
-							registrationId), ex);
-					return null;
-				}
-			}
-			builder.verificationX509Credentials(credentials -> credentials.addAll(saml2X509Credentials));
+			builder.verificationX509Credentials(credentials -> credentials.addAll(verificationCredentials));
 			builder.singleSignOnServiceLocation(singleSignOnUrl);
 			builder.singleSignOnServiceBinding(singleSignOnBinding);
 			builder.singleLogoutServiceLocation(singleLogoutUrl);
@@ -225,8 +303,8 @@ public final class JdbcAssertingPartyMetadataRepository {
 			return candidate.build().getEntityId();
 		}
 
-		private Saml2X509Credential asVerificationCredential(Certificate certificate) throws Exception {
-			X509Certificate x509Certificate = readCertificate(certificate.getCertificate());
+		private Saml2X509Credential asVerificationCredential(String certificate) throws Exception {
+			X509Certificate x509Certificate = readCertificate(certificate);
 			return new Saml2X509Credential(x509Certificate, Saml2X509Credential.Saml2X509CredentialType.ENCRYPTION,
 					Saml2X509Credential.Saml2X509CredentialType.VERIFICATION);
 		}
@@ -239,83 +317,17 @@ public final class JdbcAssertingPartyMetadataRepository {
 			return X509Support.decodeCertificate(certificate);
 		}
 
-		private List<Credential> parseCredentials(String credentials) throws JsonProcessingException {
-			if (!StringUtils.hasText(credentials)) {
-				return new ArrayList<>();
-			}
-			return OBJECT_MAPPER.readValue(credentials, new TypeReference<>() {
-			});
-		}
+	}
 
-		private List<Certificate> parseCertificate(String certificate) throws JsonProcessingException {
-			if (!StringUtils.hasText(certificate)) {
-				return new ArrayList<>();
-			}
-			return OBJECT_MAPPER.readValue(certificate, new TypeReference<>() {
-			});
-		}
+	private interface SetBytes {
 
-		private String getLobValue(ResultSet rs, String columnName) throws SQLException {
-			String columnValue = null;
-			byte[] columnValueBytes = this.lobHandler.getBlobAsBytes(rs, columnName);
-			if (columnValueBytes != null) {
-				columnValue = new String(columnValueBytes, StandardCharsets.UTF_8);
-			}
-			return columnValue;
-		}
+		void setBytes(PreparedStatement ps, int index, byte[] bytes) throws SQLException;
 
 	}
 
-	public static class Certificate {
+	private interface GetBytes {
 
-		private String certificate;
-
-		public Certificate() {
-		}
-
-		public Certificate(String certificate) {
-			this.certificate = certificate;
-		}
-
-		public String getCertificate() {
-			return this.certificate;
-		}
-
-		public void setCertificate(String certificate) {
-			this.certificate = certificate;
-		}
-
-	}
-
-	public static class Credential {
-
-		private String privateKey;
-
-		private String certificate;
-
-		public Credential() {
-		}
-
-		public Credential(String privateKey, String certificate) {
-			this.privateKey = privateKey;
-			this.certificate = certificate;
-		}
-
-		public String getPrivateKey() {
-			return this.privateKey;
-		}
-
-		public void setPrivateKey(String privateKey) {
-			this.privateKey = privateKey;
-		}
-
-		public String getCertificate() {
-			return this.certificate;
-		}
-
-		public void setCertificate(String certificate) {
-			this.certificate = certificate;
-		}
+		byte[] getBytes(ResultSet rs, String columnName) throws SQLException;
 
 	}
 
