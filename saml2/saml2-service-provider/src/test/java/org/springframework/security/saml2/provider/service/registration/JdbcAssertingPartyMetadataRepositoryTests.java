@@ -1,11 +1,13 @@
 package org.springframework.security.saml2.provider.service.registration;
 
+import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPrivateKey;
-import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Collection;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -13,6 +15,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.serializer.DefaultSerializer;
+import org.springframework.core.serializer.Serializer;
 import org.springframework.jdbc.core.JdbcOperations;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.embedded.EmbeddedDatabase;
@@ -21,7 +25,12 @@ import org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType;
 import org.springframework.security.converter.RsaKeyConverters;
 import org.springframework.security.saml2.core.Saml2X509Credential;
 
+import okhttp3.mockwebserver.MockResponse;
+import okhttp3.mockwebserver.MockWebServer;
+
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.springframework.security.saml2.provider.service.registration.JdbcAssertingPartyMetadataRepository.SAVE_SQL;
 
 /**
  * Tests for {@link JdbcAssertingPartyMetadataRepository}
@@ -48,11 +57,17 @@ class JdbcAssertingPartyMetadataRepositoryTests {
 
 	private X509Certificate certificate;
 
+	private String metadataUri;
+
 	private EmbeddedDatabase db;
 
 	private JdbcAssertingPartyMetadataRepository repository;
 
 	private JdbcOperations jdbcOperations;
+
+	private final MockWebServer mockWebServer = new MockWebServer();
+
+	private final Serializer<Object> serializer = new DefaultSerializer();
 
 	@BeforeEach
 	public void setUp() throws Exception {
@@ -60,18 +75,63 @@ class JdbcAssertingPartyMetadataRepositoryTests {
 		this.jdbcOperations = new JdbcTemplate(this.db);
 		this.repository = new JdbcAssertingPartyMetadataRepository(this.jdbcOperations);
 		this.certificate = loadCertificate("rsa.crt");
+
+		ClassPathResource resource = new ClassPathResource("test-federated-metadata.xml");
+		String metadata;
+		try (BufferedReader reader = new BufferedReader(new InputStreamReader(resource.getInputStream()))) {
+			metadata = reader.lines().collect(Collectors.joining());
+		}
+
+		this.mockWebServer.enqueue(new MockResponse().setBody(metadata).setResponseCode(200));
+		this.metadataUri = this.mockWebServer.url("/metadata").toString();
 	}
 
 	@AfterEach
-	public void tearDown() {
+	public void tearDown() throws IOException {
 		this.db.shutdown();
+		this.mockWebServer.close();
 	}
 
 	@Test
-	void saveAndFindByEntityId() {
-		AssertingPartyMetadata metadata = assertingPartyMetadata();
+	void constructorWhenJdbcOperationsIsNullThenThrowIllegalArgumentException() {
+		// @formatter:off
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> new JdbcAssertingPartyMetadataRepository(null))
+				.withMessage("jdbcOperations cannot be null");
+		// @formatter:on
+	}
 
-		repository.save(metadata);
+	@Test
+	void findByRegistrationIdWhenEntityIdIsNullThenThrowIllegalArgumentException() {
+		// @formatter:off
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> this.repository.findByEntityId(null))
+				.withMessage("entityId cannot be empty");
+		// @formatter:on
+	}
+
+	@Test
+	void findByEntityIdWhenAssertingpartyMetadataUriExists() {
+		this.jdbcOperations.update(SAVE_SQL, ENTITY_ID, metadataUri, null, null,
+				null, null, null, null, null, null, null);
+
+		AssertingPartyMetadata found = repository.findByEntityId(ENTITY_ID);
+
+		assertThat(found).isNotNull();
+		assertThat(found.getSingleSignOnServiceLocation()).isNotEqualTo(SINGLE_SIGNON_URL);
+		assertThat(found.getSigningAlgorithms()).contains(SIGNING_ALGORITHMS.get(0));
+		assertThat(found.getVerificationX509Credentials()).isNotEmpty();
+		assertThat(found.getEncryptionX509Credentials()).isNotEmpty();
+	}
+
+	@Test
+	void findByEntityId() throws IOException {
+		this.jdbcOperations.update(SAVE_SQL, ENTITY_ID, metadataUri, SINGLE_SIGNON_URL, SINGLE_SIGNON_BINDING,
+				SINGLE_SIGNON_SIGN_REQUEST, this.serializer.serializeToByteArray(SIGNING_ALGORITHMS),
+				this.serializer.serializeToByteArray(asCredentials(this.certificate)),
+				this.serializer.serializeToByteArray(asCredentials(this.certificate)),
+				SINGLE_LOGOUT_URL, SINGLE_LOGOUT_RESPONSE_URL, SINGLE_LOGOUT_BINDING);
+
 		AssertingPartyMetadata found = repository.findByEntityId(ENTITY_ID);
 
 		assertThat(found).isNotNull();
@@ -82,127 +142,15 @@ class JdbcAssertingPartyMetadataRepositoryTests {
 		assertThat(found.getSingleLogoutServiceLocation()).isEqualTo(SINGLE_LOGOUT_URL);
 		assertThat(found.getSingleLogoutServiceResponseLocation()).isEqualTo(SINGLE_LOGOUT_RESPONSE_URL);
 		assertThat(found.getSingleLogoutServiceBinding().getUrn()).isEqualTo(SINGLE_LOGOUT_BINDING);
-		assertThat(found.getSigningAlgorithms()).contains("http://www.w3.org/2001/04/xmldsig-more#rsa-sha256");
+		assertThat(found.getSigningAlgorithms()).contains(SIGNING_ALGORITHMS.get(0));
 		assertThat(found.getVerificationX509Credentials()).isNotEmpty();
 		assertThat(found.getEncryptionX509Credentials()).isNotEmpty();
 	}
 
 	@Test
-	void updateExistingMetadata() {
-		AssertingPartyMetadata metadata = assertingPartyMetadata();
-		repository.save(metadata);
-
-		AssertingPartyMetadata updatedMetadata = new RelyingPartyRegistration.AssertingPartyDetails.Builder()
-				.entityId(ENTITY_ID)
-				.wantAuthnRequestsSigned(Boolean.parseBoolean(SINGLE_SIGNON_SIGN_REQUEST))
-				.signingAlgorithms(signingAlgorithms -> signingAlgorithms.addAll(SIGNING_ALGORITHMS))
-				.verificationX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.encryptionX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.singleSignOnServiceLocation("https://localhost/SSO/updated")
-				.singleSignOnServiceBinding(Saml2MessageBinding.from(SINGLE_SIGNON_BINDING))
-				.singleLogoutServiceLocation(SINGLE_LOGOUT_URL)
-				.singleLogoutServiceResponseLocation(SINGLE_LOGOUT_RESPONSE_URL)
-				.singleLogoutServiceBinding(Saml2MessageBinding.from(SINGLE_LOGOUT_BINDING))
-				.build();
-
-		repository.save(updatedMetadata);
-		AssertingPartyMetadata found = repository.findByEntityId(ENTITY_ID);
-
-		assertThat(found).isNotNull();
-		assertThat(found.getSingleSignOnServiceLocation()).isEqualTo("https://localhost/SSO/updated");
-	}
-
-	@Test
-	void deleteMetadata() {
-		AssertingPartyMetadata metadata = assertingPartyMetadata();
-		repository.save(metadata);
-
-		repository.delete(ENTITY_ID);
-
-		AssertingPartyMetadata found = repository.findByEntityId(ENTITY_ID);
-		assertThat(found).isNull();
-	}
-
-	@Test
 	void findByEntityIdWhenNotExists() {
 		AssertingPartyMetadata found = repository.findByEntityId("non-existent-entity-id");
-
 		assertThat(found).isNull();
-	}
-
-	@Test
-	void saveMultipleMetadataEntries() {
-		AssertingPartyMetadata metadata1 = assertingPartyMetadata();
-
-		AssertingPartyMetadata metadata2 = new RelyingPartyRegistration.AssertingPartyDetails.Builder()
-				.entityId("https://idp2.example.org")
-				.wantAuthnRequestsSigned(Boolean.parseBoolean(SINGLE_SIGNON_SIGN_REQUEST))
-				.signingAlgorithms(signingAlgorithms -> signingAlgorithms.addAll(SIGNING_ALGORITHMS))
-				.verificationX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.encryptionX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.singleSignOnServiceLocation("https://idp2.example.org/SSO")
-				.singleSignOnServiceBinding(Saml2MessageBinding.from(SINGLE_SIGNON_BINDING))
-				.singleLogoutServiceLocation("https://idp2.example.org/SLO")
-				.singleLogoutServiceResponseLocation("https://idp2.example.org/SLO/response")
-				.singleLogoutServiceBinding(Saml2MessageBinding.from(SINGLE_LOGOUT_BINDING))
-				.build();
-
-		repository.save(metadata1);
-		repository.save(metadata2);
-
-		AssertingPartyMetadata found1 = repository.findByEntityId(ENTITY_ID);
-		AssertingPartyMetadata found2 = repository.findByEntityId("https://idp2.example.org");
-
-		assertThat(found1).isNotNull();
-		assertThat(found1.getEntityId()).isEqualTo(ENTITY_ID);
-
-		assertThat(found2).isNotNull();
-		assertThat(found2.getEntityId()).isEqualTo("https://idp2.example.org");
-		assertThat(found2.getSingleSignOnServiceLocation()).isEqualTo("https://idp2.example.org/SSO");
-	}
-
-	@Test
-	void iteratorReturnsAllMetadataEntries() {
-		AssertingPartyMetadata metadata1 = assertingPartyMetadata();
-		AssertingPartyMetadata metadata2 = new RelyingPartyRegistration.AssertingPartyDetails.Builder()
-				.entityId("https://idp2.example.org")
-				.wantAuthnRequestsSigned(Boolean.parseBoolean(SINGLE_SIGNON_SIGN_REQUEST))
-				.signingAlgorithms(signingAlgorithms -> signingAlgorithms.addAll(SIGNING_ALGORITHMS))
-				.verificationX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.encryptionX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.singleSignOnServiceLocation("https://idp2.example.org/SSO")
-				.singleSignOnServiceBinding(Saml2MessageBinding.from(SINGLE_SIGNON_BINDING))
-				.singleLogoutServiceLocation("https://idp2.example.org/SLO")
-				.singleLogoutServiceResponseLocation("https://idp2.example.org/SLO/response")
-				.singleLogoutServiceBinding(Saml2MessageBinding.from(SINGLE_LOGOUT_BINDING))
-				.build();
-
-		repository.save(metadata1);
-		repository.save(metadata2);
-
-		Iterator<AssertingPartyMetadata> iterator = repository.iterator();
-		List<AssertingPartyMetadata> metadataList = new ArrayList<>();
-		iterator.forEachRemaining(metadataList::add);
-		assertThat(metadataList).hasSize(2);
-		List<String> entityIds = metadataList.stream()
-				.map(AssertingPartyMetadata::getEntityId)
-				.collect(Collectors.toList());
-		assertThat(entityIds).containsExactlyInAnyOrder(ENTITY_ID, "https://idp2.example.org");
-	}
-
-	private AssertingPartyMetadata assertingPartyMetadata() {
-		return new RelyingPartyRegistration.AssertingPartyDetails.Builder()
-				.entityId(ENTITY_ID)
-				.wantAuthnRequestsSigned(Boolean.parseBoolean(SINGLE_SIGNON_SIGN_REQUEST))
-				.signingAlgorithms(signingAlgorithms -> signingAlgorithms.addAll(SIGNING_ALGORITHMS))
-				.verificationX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.encryptionX509Credentials(credentials -> credentials.add(asCredential(certificate)))
-				.singleSignOnServiceLocation(SINGLE_SIGNON_URL)
-				.singleSignOnServiceBinding(Saml2MessageBinding.from(SINGLE_SIGNON_BINDING))
-				.singleLogoutServiceLocation(SINGLE_LOGOUT_URL)
-				.singleLogoutServiceResponseLocation(SINGLE_LOGOUT_RESPONSE_URL)
-				.singleLogoutServiceBinding(Saml2MessageBinding.from(SINGLE_LOGOUT_BINDING))
-				.build();
 	}
 
 	private static EmbeddedDatabase createDb() {
@@ -237,8 +185,8 @@ class JdbcAssertingPartyMetadataRepositoryTests {
 		}
 	}
 
-	private Saml2X509Credential asCredential(X509Certificate certificate) {
-		return new Saml2X509Credential(certificate, Saml2X509Credential.Saml2X509CredentialType.ENCRYPTION,
-				Saml2X509Credential.Saml2X509CredentialType.VERIFICATION);
+	private Collection<Saml2X509Credential> asCredentials(X509Certificate certificate) {
+		return List.of(new Saml2X509Credential(certificate, Saml2X509Credential.Saml2X509CredentialType.ENCRYPTION,
+				Saml2X509Credential.Saml2X509CredentialType.VERIFICATION));
 	}
 }

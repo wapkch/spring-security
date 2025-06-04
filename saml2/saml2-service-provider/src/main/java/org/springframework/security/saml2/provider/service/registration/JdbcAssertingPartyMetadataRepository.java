@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import org.apache.commons.logging.Log;
@@ -44,6 +45,7 @@ import org.springframework.jdbc.core.SqlParameterValue;
 import org.springframework.security.saml2.core.Saml2X509Credential;
 import org.springframework.security.saml2.provider.service.registration.RelyingPartyRegistration.AssertingPartyDetails;
 import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
 
 /**
  * A JDBC implementation of {@link AssertingPartyMetadataRepository}.
@@ -65,6 +67,7 @@ public final class JdbcAssertingPartyMetadataRepository implements AssertingPart
 
 	// @formatter:off
 	static final String COLUMN_NAMES = "entity_id, "
+			+ "metadata_uri, "
 			+ "singlesignon_url, "
 			+ "singlesignon_binding, "
 			+ "singlesignon_sign_request, "
@@ -88,9 +91,9 @@ public final class JdbcAssertingPartyMetadataRepository implements AssertingPart
 	private static final String LOAD_ALL_SQL = "SELECT " + COLUMN_NAMES
 			+ " FROM " + TABLE_NAME;
 
-	private static final String SAVE_SQL = "INSERT INTO " + TABLE_NAME + " ("
+	protected static final String SAVE_SQL = "INSERT INTO " + TABLE_NAME + " ("
 			+ COLUMN_NAMES
-			+ ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+			+ ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 	// @formatter:on
 
 	private static final String DELETE_SQL = "DELETE FROM " + TABLE_NAME + " WHERE " + ENTITY_ID_FILTER;
@@ -275,54 +278,71 @@ public final class JdbcAssertingPartyMetadataRepository implements AssertingPart
 		@Override
 		public AssertingPartyMetadata mapRow(ResultSet rs, int rowNum) throws SQLException {
 			String entityId = rs.getString("entity_id");
+			if (entityId == null) {
+				this.logger.debug("entityId can not be null");
+				return null;
+			}
+			String metadataUri = rs.getString("metadata_uri");
 			String singleSignOnUrl = rs.getString("singlesignon_url");
-			Saml2MessageBinding singleSignOnBinding = Saml2MessageBinding
-					.from(rs.getString("singlesignon_binding"));
+			Saml2MessageBinding singleSignOnBinding = Saml2MessageBinding.from(rs.getString("singlesignon_binding"));
 			boolean singleSignOnSignRequest = rs.getBoolean("singlesignon_sign_request");
-			List<String> signingAlgorithms;
-			try {
-				signingAlgorithms = (List<String>) deserializer.deserializeFromByteArray(
-						this.getBytes.getBytes(rs, "signing_algorithms"));
-			} catch (IOException ex) {
-				this.logger.debug(
-						LogMessage.format("Verification credentials of %s could not be parsed.", entityId), ex);
-				return null;
-			}
-			Collection<Saml2X509Credential> verificationCredentials;
-			try {
-				verificationCredentials = (Collection<Saml2X509Credential>) deserializer.deserializeFromByteArray(
-						this.getBytes.getBytes(rs, "verification_credentials"));
-			} catch (IOException ex) {
-				this.logger.debug(
-						LogMessage.format("Verification credentials of %s could not be parsed.", entityId), ex);
-				return null;
-			}
-			Collection<Saml2X509Credential> encryptionCredentials;
-			try {
-				encryptionCredentials = (Collection<Saml2X509Credential>) deserializer.deserializeFromByteArray(
-						this.getBytes.getBytes(rs, "encryption_credentials"));
-			} catch (IOException ex) {
-				this.logger.debug(
-						LogMessage.format("Encryption credentials of %s could not be parsed.", entityId), ex);
-				return null;
-			}
 			String singleLogoutUrl = rs.getString("singlelogout_url");
 			String singleLogoutResponseUrl = rs.getString("singlelogout_response_url");
-			Saml2MessageBinding singleLogoutBinding = Saml2MessageBinding
-					.from(rs.getString("singlelogout_binding"));
+			Saml2MessageBinding singleLogoutBinding = Saml2MessageBinding.from(rs.getString("singlelogout_binding"));
+			byte[] signingAlgorithmsBytes = this.getBytes.getBytes(rs, "signing_algorithms");
+			byte[] verificationCredentialsBytes = this.getBytes.getBytes(rs, "verification_credentials");
+			byte[] encryptionCredentialsBytes = this.getBytes.getBytes(rs, "encryption_credentials");
 
-			return new AssertingPartyDetails.Builder()
-					.entityId(entityId)
-					.wantAuthnRequestsSigned(singleSignOnSignRequest)
-					.signingAlgorithms(algorithms -> algorithms.addAll(signingAlgorithms))
-					.verificationX509Credentials(credentials -> credentials.addAll(verificationCredentials))
-					.encryptionX509Credentials(credentials -> credentials.addAll(encryptionCredentials))
-					.singleSignOnServiceLocation(singleSignOnUrl)
-					.singleSignOnServiceBinding(singleSignOnBinding)
-					.singleLogoutServiceLocation(singleLogoutUrl)
-					.singleLogoutServiceBinding(singleLogoutBinding)
-					.singleLogoutServiceResponseLocation(singleLogoutResponseUrl)
-					.build();
+			boolean usingMetadata = StringUtils.hasText(metadataUri);
+			AssertingPartyMetadata.Builder<?> builder = (!usingMetadata) ? new AssertingPartyDetails.Builder().entityId(entityId)
+					: createBuilderUsingMetadata(entityId, metadataUri);
+			try {
+				if (signingAlgorithmsBytes != null) {
+					List<String> signingAlgorithms = (List<String>) deserializer.deserializeFromByteArray(signingAlgorithmsBytes);
+					builder.signingAlgorithms(algorithms -> algorithms.addAll(signingAlgorithms));
+				}
+				if (verificationCredentialsBytes != null) {
+					Collection<Saml2X509Credential> verificationCredentials = (Collection<Saml2X509Credential>) deserializer.deserializeFromByteArray(verificationCredentialsBytes);
+					builder.verificationX509Credentials(credentials -> credentials.addAll(verificationCredentials));
+				}
+				if (encryptionCredentialsBytes != null) {
+					Collection<Saml2X509Credential> encryptionCredentials = (Collection<Saml2X509Credential>) deserializer.deserializeFromByteArray(encryptionCredentialsBytes);
+					builder.encryptionX509Credentials(credentials -> credentials.addAll(encryptionCredentials));
+				}
+			} catch (Exception ex) {
+				this.logger.debug(
+						LogMessage.format("Parsing serialized credentials for entity %s failed", entityId), ex);
+				return null;
+			}
+
+			applyingWhenNonNull(singleSignOnUrl, builder::singleSignOnServiceLocation);
+			applyingWhenNonNull(singleSignOnBinding, builder::singleSignOnServiceBinding);
+			applyingWhenNonNull(singleSignOnSignRequest, builder::wantAuthnRequestsSigned);
+			applyingWhenNonNull(singleLogoutUrl, builder::singleLogoutServiceLocation);
+			applyingWhenNonNull(singleLogoutResponseUrl, builder::singleLogoutServiceResponseLocation);
+			applyingWhenNonNull(singleLogoutBinding, builder::singleLogoutServiceBinding);
+			return builder.build();
+		}
+
+		private <T> void applyingWhenNonNull(T value, Consumer<T> consumer) {
+			if (value != null) {
+				consumer.accept(value);
+			}
+		}
+
+		private AssertingPartyMetadata.Builder<?> createBuilderUsingMetadata(String entityId, String metadataUri) {
+			Collection<AssertingPartyMetadata.Builder<?>> candidates = AssertingPartyMetadata
+					.collectionFromMetadataLocation(metadataUri);
+			for (AssertingPartyMetadata.Builder<?> candidate : candidates) {
+				if (entityId == null || entityId.equals(getEntityId(candidate))) {
+					return candidate;
+				}
+			}
+			throw new IllegalStateException("No asserting party metadata with Entity ID '" + entityId + "' found");
+		}
+
+		private Object getEntityId(AssertingPartyMetadata.Builder<?> candidate) {
+			return candidate.build().getEntityId();
 		}
 	}
 
